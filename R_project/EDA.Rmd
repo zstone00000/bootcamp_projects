@@ -1,0 +1,1127 @@
+---
+title: "EDA"
+author: "Zach Stone"
+date: "2022-08-06"
+output: html_document
+---
+
+# Setup and imports
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/Users/zachstone/Documents/coursework/NYCDSA/R_project')
+```
+
+```{r, warning=FALSE}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(rjson)
+library(geojsonio)
+library(sp)
+library(rgeos)
+library("haven")
+library("survey")
+```
+
+```{r}
+source("./make_ziptable.R") 
+source("./make_fort.R")
+```
+
+
+
+## Get census data
+
+```{r, warning=FALSE}
+source("./census_import.R") 
+census_path = 'data/nyc_decennialcensusdata_2010_2020_change.xlsx'
+census_list = parse_census2020(census_path)
+
+income_data = import_income('data/census_income.csv')
+income = income_data
+```
+
+```{r}
+names(census_list)
+census2010 = census_list[['_10']]
+census2020 = census_list[['_20']]
+census_ch = census_list[['_Ch']]
+```
+
+
+## Make zip table and attach to census
+
+```{r}
+zip_table = make_ziptable('data/TRACT_ZIP_122020.xlsx')
+```
+
+```{r}
+#still has many missing zip codes due to imperfect location encoding by zip code
+census2020 = census2020 %>%
+  left_join(zip_table, by = c("GeoID" = "tract")) %>%
+  select(c(1:4,ncol(census2020)+1,5:ncol(census2020))) 
+```
+
+```{r}
+census2010 = census2010 %>%
+  left_join(zip_table, by = c("GeoID" = "tract")) %>%
+  select(c(1:4,ncol(census2010)+1,5:ncol(census2010))) 
+```
+
+```{r}
+#GeoJoinIDs for air quality measurements
+geojoin.zip.conversion = read.csv('data/UHF_zip_conversion.csv')
+```
+
+
+## Get census GeoJSON data and merge with census data
+
+```{r}
+tract_spdf_data = geojson_read('data/census2020.json', what = 'sp')
+tract.spdf = tract_spdf_data
+```
+
+```{r}
+census2020.spdf = merge(tract.spdf, census2020, by.x = 'GEOID', by.y = 'GeoID')
+```
+
+```{r}
+#Make zipcoded census spdf
+grouped.sp = gUnaryUnion(census2020.spdf, id = census2020.spdf$zip)
+grouped.df = data.frame(zip = row.names(grouped.sp), row.names = row.names(grouped.sp))
+zip.spdf = SpatialPolygonsDataFrame(grouped.sp, grouped.df)
+```
+## Get zoning GeoJSON data
+
+```{r}
+nyzd_data = geojson_read('data/nyzd.json', what = 'sp')
+nyzd.spdf = nyzd_data
+```
+
+## Import healthcare data
+
+```{r}
+source('med_import.R') 
+med = import_chronic('data/Medicaid_Chronic_Conditions__Inpatient_Admissions_and_Emergency_Room_Visits_by_Zip_Code__Beginning_2012.csv')
+
+medtotals = import_totals('data/Medicaid_Beneficiaries__Inpatient_Admissions_and_Emergency_Room_Visits_by_Zip_Code__Beginning_2012.csv')
+```
+
+```{r}
+#med df is separated out by dual and non-dual eligibility
+#sum over these for each location and disease
+med.zip = med %>%
+  group_by(Year, Zip.Code, Boro, Major.Diagnostic.Category, Episode.Disease.Category) %>%
+   summarize(across(where(is.numeric), ~ sum(.x))) %>% ungroup
+```
+
+## Import tobacco data
+
+```{r}
+source('tobaccostore_import.R')
+tobac_data = import_tobac('data/Active_Tobacco_Retail_Dealer_Licenses.csv')
+tobac = tobac_data
+```
+
+## Import air data
+
+```{r}
+#Contains data for 19 different measures
+air_data = read.csv('data/Air_Quality.csv')
+air = air_data
+```
+
+## Import rat data
+
+```{r}
+source('rat_data.R')
+rat_data = import_ratdata('data/rat_data2009-2014.json')
+rat = rat_data
+```
+
+## Import CHS data
+
+```{r}
+chs20<-read_sas("data/chs2020_public.sas7bdat")
+```
+
+# EDA
+
+## Asthma and location
+### Look at asthma hospitalization rates by zip
+
+```{r}
+med.asthma = med.zip %>%
+  filter(Episode.Disease.Category == 'Asthma') %>% #Filter asthma
+  select(year = Year, zip = Zip.Code, boro = Boro, 
+         n_ben = Beneficiaries.with.Condition, unique_admit = Beneficiaries.with.Admissions, 
+         total_admit = Total.Inpatient.Admissions, unique_er = Beneficiaries.with.ER.Visits,
+         total_er = Total.ER.Visits) %>% #subset and rename columns
+  inner_join(medtotals %>% select(year = Year, zip = Zip.Code, boro = Boro, ben_total = Total.Beneficiaries),
+             by = c('year', 'zip', 'boro')) %>% #merge total benficiaries by zip
+  select(c(1:3, ncol(.), 4:ncol(.)-1)) #arrange columns
+```
+
+```{r}
+asthma.rate.byzip2014 = med.asthma %>%
+  filter(year == 2014) %>%
+  transmute(zip, boro, asthma_rate = n_ben/ben_total)
+```
+
+
+Merge with spdf
+```{r}
+#Prep df rows
+row.names(asthma.rate.byzip2014) = asthma.rate.byzip2014$zip
+```
+
+
+```{r}
+asthma.rate.byzip2014.spdf = merge(zip.spdf, asthma.rate.byzip2014, by = 'zip')
+```
+
+
+```{r}
+# spplot(asthma.rate.byzip2014.spdf, zcol = 'asthma_rate')
+```
+
+```{r, warning=FALSE}
+asthma.rate.byzip2014.fort = make.fort(asthma.rate.byzip2014.spdf)
+```
+
+```{r}
+p0 <- ggplot(data = asthma.rate.byzip2014.fort, aes(x = long, y = lat, group = group, fill = asthma_rate)) +
+geom_polygon() +
+geom_path(color = "white", size = 0.2) +
+coord_equal() +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+scale_fill_continuous(type = "viridis") +
+theme(axis.title = element_blank(), axis.text = element_blank()) +
+labs(title = "Rate of Medicare/Medicaid Benficiaries with Asthma by Zip (in (2014)")
+print(p0)
+
+# ggsave(plot = p0, 'asthmarate_byzip.png', device = 'png', dpi = 320, scale = 2)
+```
+```{r}
+ggplot(data = asthma.rate.byzip2014.fort, aes(x = long, y = lat, group = group, fill = asthma_rate)) +
+geom_polygon() +
+geom_path(color = "white", size = 0.2) +
+coord_equal() +
+  xlim(c(-73.96,-73.76)) +
+  ylim(c(40.75,40.95)) +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+scale_fill_continuous(type = "viridis") +
+labs(title = "Rate of Medicare/Medicaid Benficiaries with Asthma by Zip")
+```
+
+
+Some of the findings about Mott Haven are confirmed, showing higher asthma rates. Though, it looks like it is higher throughout the whole area. Interestingly, this pattern seems to hold throughout the map. There are not isolated 'hotspots', but rather entire areas which are gradiently heightened.
+
+Another strip which looks elevated, though not by nearly as much, is throughout Crown Heights - Bed Stuy - Bushwick - Ridgewood area, along with some of the Rockaways.
+
+### First run chi2 to show that location impacts asthma rate
+
+```{r}
+#Create asthma by zip contingency table
+asthma.zip.contingency.df = med.asthma %>%
+  filter(year == 2014) %>%
+  transmute(zip, yes = n_ben, no = ben_total - n_ben) 
+
+asthma.zip.table = cbind(asthma.zip.contingency.df$yes, asthma.zip.contingency.df$no)
+rownames(asthma.zip.table) = asthma.zip.contingency.df$zip
+colnames(asthma.zip.table) = c('yes', 'no')
+```
+
+```{r}
+#Chi squared with p<0.05
+chisq.test(asthma.zip.table) 
+```
+
+Extremely likely that asthma rate is not independent of location.
+
+### Run binomial tests to see which areas are significantly over citywide average rates
+
+```{r}
+#Citywide
+med.asthma %>%
+  filter(year == 2014) %>%
+  summarize(pop = sum(ben_total), asthma_rate = sum(n_ben)/sum(ben_total))
+
+asthma.rate.city = summarize(med.asthma,sum(n_ben)/sum(ben_total))[[1,1]]
+```
+
+```{r}
+asthma.zip.counts = med.asthma %>%
+  filter(year == 2014) %>%
+  transmute(zip, ben_total, ben_asthma = n_ben, asthma_rate = n_ben/ben_total) %>%
+  arrange(desc(asthma_rate))
+```
+
+Binomial test for single zip code
+```{r}
+binom.test(1188, 9287, p = asthma.rate.city, alternative = "greater")$p.value
+```
+
+```{r}
+
+asthma.zip.rates = asthma.zip.counts %>%
+  mutate(greater_citywide_pval = unlist(mapply(binom.test, asthma.zip.counts$ben_asthma, asthma.zip.counts$ben_total,
+       p = rep(asthma.rate.city, nrow(asthma.zip.counts)),
+       alternative= "greater")[3,]))
+
+#About 30% of zip codes are identified as significantly higher than citywide asthma rate
+asthma.zip.rates %>%
+  filter(greater_citywide_pval <= 0.05)
+
+med %>%
+  select(Zip.Code) %>%
+  unique() %>%
+  summarize(n())
+```
+
+### Plot regions with significantly higher asthma rates
+
+```{r}
+asthma.zip.rates = asthma.zip.rates %>%
+  mutate(sign_greater = greater_citywide_pval <= 0.05) %>%
+  filter(zip != 10000)
+```
+
+```{r}
+asthma.zip.rates
+```
+
+```{r}
+#Prep df rows
+row.names(asthma.zip.rates) = asthma.zip.rates$zip
+asthma.greater.spdf = merge(zip.spdf, asthma.zip.rates, by = 'zip')
+```
+
+```{r, warning=FALSE}
+asthma.greater.fort = make.fort(asthma.greater.spdf)
+```
+
+```{r}
+p1 <- ggplot(data = asthma.greater.fort, aes(x = long, y = lat, group = group, fill = !sign_greater)) +
+   scale_fill_manual(labels = c("True", "False"), values = c("#EA4969", "#56BFFB")) + 
+geom_polygon() +
+geom_path(color = "white", size = 0.2) +
+coord_equal() +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+theme(axis.title = element_blank(), axis.text = element_blank()) +
+labs(title = "Areas with significantly higher asthma rate than citywide average",
+     fill = 'Asthma Rates \n significantly higher\n than city average (2014)')
+print(p1)
+```
+
+Interestingly, the areas are mostly contiguous, indicating subdivisions into the map of larger high and low risk areas.
+
+Check the Rockaways, Staten Island, and Coney Island for low population.
+
+```{r}
+rock = c(11697, 11694, 11693, 11692)
+coney = c(11224)
+si.indust = c(10311)
+staten = c(10303, 10302, 10310, 10301, 10314)
+
+#Rockaway numbers are somewhat lower, but still in thousands
+asthma.zip.rates %>%
+  filter(zip %in% c(rock,coney,si.indust, staten))
+
+```
+
+
+
+## Tobacco 
+
+### Plot tobacco locations
+
+```{r}
+tobac.sp = SpatialPoints(tobac %>% select(long,lat) %>% filter(!is.na(long) & !is.na(lat))
+                         , proj4string = CRS('+proj=longlat +datum=WGS84 +no_defs'))
+```
+
+```{r}
+plot(tract.spdf)
+points(tobac.sp, col = 'red', pch = 3)
+```
+
+Far too much to be visible. Three ideas of different complexity:
+-   Group by zip, and look at number per zip (simplest, coursest)
+-   Two geometric methods:
+  -   Pointwise, look at number within a certain range, and compare to pointwise asthma estimate for that range
+  -   Same as above, but weighting by distance
+  -   To find pointwise asthma estimate, should take a region around point. Suppose it intersects with Zips Z1, ... , Zn. Then to find the proportion for that block, find for each Zi, (area of interseciton with Zi)/(area of Zi) * total_ben to find approximate ben in that intersection. Then, do the same but times * n_ben_asthma. Then sum all of the n_ben_asthmas and divide by sum of total_bens
+
+Start with simplest: counts by zip
+
+```{r}
+tobac.zip = tobac %>%
+  group_by(zip) %>%
+  summarize(store_count = n())
+```
+
+
+```{r}
+tobac.zip.spdf = merge(zip.spdf,tobac.zip, by = 'zip')
+```
+
+```{r}
+spplot(tobac.zip.spdf, zcol = 'store_count')
+```
+This is clearly a bad method because zips are largely different in size. Could do per capita or per benficiary.
+
+```{r}
+#Create population by zip
+pop.zip = census2020 %>%
+  filter(!is.na(zip)) %>%
+  group_by(zip) %>%
+  summarize(pop = sum(Pop_20))
+
+tob_percap.zip = inner_join(tobac.zip,pop.zip, by = 'zip') %>%
+  mutate(tobac_percap = store_count/pop)
+```
+
+
+```{r}
+#extreme outliers due to low population in certain zips. These are:
+# JFK 11430
+#Pelham bay park 10464
+# Parts of the roackaways 11697
+# tob_percap.zip %>%
+#   arrange(desc(tobac_percap))
+
+#artificially low pop as well, remove from dataset
+# tob_percap.zip %>%
+#   arrange(pop)
+
+tob_percap.zip = tob_percap.zip %>%
+  filter(!(zip %in% c(11430, 10464, 11697)))
+```
+
+
+```{r}
+#Still lots of irregularities, so should normalize
+# spplot(tob_percap.zip.spdf, zcol = 'tobac_percap')
+```
+
+```{r}
+#log somewhat better
+ggplot(tob_percap.zip, aes(x = tobac_percap)) +
+  geom_histogram(bins = 50) +
+  scale_x_log10()
+```
+
+```{r}
+tob_percap.zip = tob_percap.zip %>%
+  mutate(log_percap = log(tobac_percap))
+```
+
+
+```{r}
+#Create spdf
+tob_percap.zip.spdf = merge(zip.spdf, tob_percap.zip, by = 'zip')
+```
+
+```{r}
+# spplot(tob_percap.zip.spdf, zcol = 'log_percap')
+```
+
+Somewhat better. This is a very rough metric, starting with the geographic divisions, and the indirect link between stores and actual smokers, esp indoors and/or w children, like the original study. Somewhat elevated in the CH region, but doesn't look significnatly elevated in the bronx region.
+
+```{r}
+tob_percap.zip.fort = make.fort(tob_percap.zip.spdf)
+```
+
+```{r}
+p2 <- ggplot() +
+geom_polygon(data = tob_percap.zip.fort, aes(x = long, y = lat, group = group, fill = log_percap)) +
+geom_path(data = tob_percap.zip.fort, 
+          aes(x = long, y = lat, group = group, fill = log_percap), 
+          color = "white", size = 0.2) +
+coord_equal() +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+theme(axis.title = element_blank(), axis.text = element_blank()) +
+scale_fill_continuous(type = "viridis") +
+labs(title = "Tobacco Stores Per Capita by Zip (current)")
+print(p2)
+```
+
+There doesn't seem to be a strong correlation, we can check:
+
+```{r}
+rate.vs.tob_percap.zip = asthma.zip.rates %>%
+  inner_join(tob_percap.zip, by = 'zip') %>%
+  select(zip, asthma_rate, log_percap)
+
+ggplot(rate.vs.tob_percap.zip, aes(x = asthma_rate, y = log_percap)) +
+  geom_point() +
+  labs(x = 'Asthma Proportion', y= 'log(tobacco stores per capita)',
+       title = 'Asthma rates vs. tobacco stores per capita')
+
+#low correlation
+cor(rate.vs.tob_percap.zip$asthma_rate, rate.vs.tob_percap.zip$log_percap)
+```
+
+Can't repeat smoking rate to overall cases because cannot access geographical locations of CHS. 
+XXX However, can add "how often do u smell smoke in your apt" vs. asthma which gives some measure.
+
+## Air quality
+
+Air quality data is only on UHF Neighborhood codes. First have to create map with UHF boundaries. Column containing the coes is called "Geo.Join.ID".
+
+### Setup UHF42 code map 
+
+```{r} 
+#Create spdf merged over Geo.Join.ID with one col corresponding to ID
+geojoin.spdf = merge(zip.spdf,geojoin.zip.conversion, by = 'zip')
+geo.grouped.sp = gUnaryUnion(geojoin.spdf, id = geojoin.spdf$Geo.Join.ID)
+df = data.frame(Geo.Join.ID = row.names(geo.grouped.sp), row.names = row.names(geo.grouped.sp))
+uhf.spdf = SpatialPolygonsDataFrame(geo.grouped.sp, df)
+```
+
+### Air data 1: O3 Hosp Rate by UHF
+
+```{r}
+#Start with a simple measure - O3-Attributable Asthma Hospitalizations (ozone)
+#3 different time periods covered. Let's look at 2012-2014 since this is closest to hospital records
+air %>%
+  filter(Name == 'O3-Attributable Asthma Hospitalizations') %>%
+  group_by(Time.Period) %>%
+  summarize(n())
+
+#Two different groups to separate out; 0-17 yrs and 18+
+air %>%
+  filter(Name == 'O3-Attributable Asthma Hospitalizations', Time.Period == '2012-2014') %>%
+  group_by(Measure) %>%
+  summarize(n())
+
+#Get dataframes with O3 asthma hospitalization rate for each age group
+ozone.hosp.1214.child = air %>%
+  filter(Name == 'O3-Attributable Asthma Hospitalizations', Time.Period == '2012-2014', Measure == 'Estimated Annual Rate- Children 0 to 17 Yrs Old', Geo.Type.Name == 'UHF42') %>%
+  select(id = Unique.ID, Geo.Join.ID, Data.Value)
+
+ozone.hosp.1214.adult = air %>%
+  filter(Name == 'O3-Attributable Asthma Hospitalizations', Time.Period == '2012-2014', Measure == 'Estimated Annual Rate- 18 Yrs and Older', Geo.Type.Name == 'UHF42') %>%
+  select(id = Unique.ID, Geo.Join.ID, Data.Value)
+
+
+ozone.hosp.1214.citywide = air %>%
+  filter(Name == 'O3-Attributable Asthma Hospitalizations', Time.Period == '2012-2014', Geo.Type.Name == 'Citywide') 
+```
+
+```{r}
+#Merge data into spdf
+ozone.hosp.1214.child.spdf = merge(uhf.spdf, ozone.hosp.1214.child)
+ozone.hosp.1214.adult.spdf = merge(uhf.spdf, ozone.hosp.1214.adult)
+```
+
+```{r, warning=FALSE}
+#Agrees with hospital data for higher in Harlem/South Bronx area and CH/Ridgewood area
+#O3 attributable asthma hospitalization per 100k
+ozone.hosp.1214.child.fort = make.fort(ozone.hosp.1214.child.spdf)
+ozone.hosp.1214.adult.fort = make.fort(ozone.hosp.1214.adult.spdf)
+
+#Plot child rates
+ggplot() +
+geom_polygon(data = ozone.hosp.1214.child.fort, aes(x = long, y = lat, group = group, fill = Data.Value)) +
+geom_path(data = ozone.hosp.1214.child.fort, 
+          aes(x = long, y = lat, group = group), 
+          color = "white", size = 0.2) +
+coord_equal() +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+theme(axis.title = element_blank(), axis.text = element_blank()) +
+scale_fill_continuous(type = "viridis") +
+labs(title = "O3-attributable asthma visits (child)", fill = 'Hospital visits per 100k')
+
+#Plot adult rates
+ggplot() +
+geom_polygon(data = ozone.hosp.1214.adult.fort, aes(x = long, y = lat, group = group, fill = Data.Value)) +
+geom_path(data = ozone.hosp.1214.adult.fort, 
+          aes(x = long, y = lat, group = group), 
+          color = "white", size = 0.2) +
+coord_equal() +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+theme(axis.title = element_blank(), axis.text = element_blank()) +
+scale_fill_continuous(type = "viridis") +
+labs(title = "Average O3-attributable asthma visits 2012-2014 (adult)", fill = 'Hospital visits per 100k')
+```
+
+### Look into O3 air quality
+
+```{r}
+# Over a wide range of times. May want to subset 2012-2014 and aggregate, since that's the time period near hospitalizations
+air %>%
+  filter(Name == 'Ozone (O3)') %>%
+  group_by(Time.Period) %>%
+  summarize(n())
+
+#Average over value from each summer between 2012-2014 on neighborhood data
+O3.1214 = air %>%
+  filter(Name == 'Ozone (O3)', Geo.Type.Name == 'UHF42',
+         Time.Period %in% c('Summer 2012', 'Summer 2013', 'Summer 2014' )) %>%
+  group_by(Geo.Join.ID) %>%
+  summarize(Name = first(Name), Measure = first(Measure), Measure.Info = first(Measure.Info),
+            avg.ppb = mean(Data.Value))
+```
+
+```{r}
+O3.1214.spdf = merge(uhf.spdf, O3.1214)
+```
+
+```{r}
+spplot(O3.1214.spdf, zcol = 'avg.ppb')
+
+O3.1214.fort = make.fort(O3.1214.spdf)
+
+ggplot() +
+geom_polygon(data = O3.1214.fort, aes(x = long, y = lat, group = group, fill = avg.ppb)) +
+geom_path(data = O3.1214.fort, 
+          aes(x = long, y = lat, group = group), 
+          color = "white", size = 0.2) +
+coord_equal() +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+theme(axis.title = element_blank(), axis.text = element_blank()) +
+scale_fill_continuous(type = "viridis") +
+labs(title = "O3 across NYC (2012-2014)", fill = 'O3 concentration (ppb)')
+```
+
+We can see some elevated regions, but not clear if significantly different or correlated to hospitalization rates, even O3 attributable ones. Of the major hotspots: mildly higher in Bronx, Very High for Rockaways, actually lower for Staten Island and Lower Manhattan, and average for CH/Ridgewood.
+
+```{r}
+#One outlier above and 3 below
+O3.1214 %>%
+  ggplot(data = ., aes(x = avg.ppb)) +
+  geom_density()
+
+#Low end looks on par with other neighborhoods
+O3.1214 %>%
+  arrange(avg.ppb)
+
+#Region 410 significantly higher
+O3.1214 %>%
+  arrange(desc(avg.ppb))
+
+#Quartiles
+quantile(O3.1214$avg.ppb)
+```
+
+```{r}
+data.frame(O3.ppb = O3.1214$avg.ppb, O3.hosp.adult = ozone.hosp.1214.adult$Data.Value) %>%
+  ggplot(data = ., aes(x = O3.ppb, y = O3.hosp.adult)) +
+    geom_point() +
+    geom_vline(xintercept = 30.15917, color = 'red', linetype ='dashed') +
+    geom_vline(xintercept = 31.58833, color = 'blue', linetype ='dashed') +
+    geom_vline(xintercept = 32.50333, color = 'red', linetype ='dashed') +
+    labs(x = 'O3 (ppb)', y = 'O3-attributable adult hospitalization rate \n per 100k people', title = 'O3 prevalence vs. \n O3-attributable adult asthma hospitalizations by UHF Neighborhood') + 
+    annotate("label", x = 36, y = 15, label = "Dashed lines \n indicate quartiles",parse = FALSE)
+    # annotate("text", x = 32.50333, y = 10, label  = '', parse = TRUE)
+```
+
+While there is a somewhat positive correlation, we can see that for the middle 50% of O3.ppb values - between about 30 and 32.5 ppb, and even beyond, this correlation is weak, even possibly goes the other way. 
+
+### Check benzene concentrations
+
+```{r}
+#2011 is closest timeframe
+air %>%
+  filter(Name == 'Air Toxics Concentrations- Average Benzene Concentrations') %>%
+  group_by(Time.Period) %>%
+  summarize(n())
+
+benzene.2011 = air %>%
+  filter(Name == 'Air Toxics Concentrations- Average Benzene Concentrations',
+         Time.Period == 2011, Geo.Type.Name == 'UHF42')
+
+#make spdf
+benzene.2011.spdf = merge(uhf.spdf,benzene.2011, by = 'Geo.Join.ID')
+```
+
+```{r}
+#Benzene concentration 2011
+#Also does not look correlated for Bronx
+spplot(benzene.2011.spdf, zcol = 'Data.Value')
+```
+Uncorrelated for Bronx, Rockaways, Staten Island, CH. But aligns with Lower Manhattan hotspot.
+
+### Check fine particulate (PM2.5) distribution
+
+```{r}
+#Various summers and winters over relevant time period
+air %>%
+  filter(Name == 'Fine Particulate Matter (PM2.5)', Geo.Type.Name == 'UHF42') %>%
+  group_by(Time.Period) %>%
+  summarize(n())
+
+#Filter for neighborhood values of pm from Summer 2012 - Beginning of 2015
+#Add season column for summer vs. winter
+pm.1214 = air %>%
+  filter(Name == 'Fine Particulate Matter (PM2.5)', Geo.Type.Name == 'UHF42',
+         Time.Period %in% c('Summer 2012', 'Summer 2013', 'Summer 2014',
+                            'Winter 2012-13', 'Winter 2013-14', 'Winter 2014-15')) %>%
+  mutate(Season = regmatches(Time.Period,regexpr("[A-Za-z]+",Time.Period)))
+
+#Check if values significantly different by season
+pm.1214 %>%
+  select(id = Unique.ID, Geo.Join.ID, Time.Period, avg_mcg_per_cm3 = Data.Value, Season) %>%
+  group_by(Geo.Join.ID, Season) %>%
+  summarize(value = mean(avg_mcg_per_cm3)) %>% 
+  pivot_wider(data = ., names_from = Season, values_from = value) %>% #Looks like higher in winters across areas
+  mutate(win_geq_sum = Winter >= Summer) %>% ungroup %>%
+  summarize(sum(win_geq_sum)/n()) #yes always
+
+#Just look at worst time of year - winter
+pm.1214.winter.avg = pm.1214 %>%
+  select(id = Unique.ID, Geo.Join.ID, Time.Period, avg_mcg_per_cm3 = Data.Value, Season) %>%
+  filter(Season == 'Winter') %>%
+  group_by(Geo.Join.ID) %>%
+  summarize(avg_mcg_per_cm3 = mean(avg_mcg_per_cm3)) 
+```
+
+```{r}
+library(latex2exp)
+ggplot(pm.1214.winter.avg, aes(x = avg_mcg_per_cm3)) +
+  geom_histogram(bins = 18, aes(y = ..density..), fill = 'orange') +
+  geom_density() +
+  labs(x = TeX('Average PM2.5 Density in Winters 2012-2014 ($mcg/cm^3$)'),
+       y = 'Density', title = 'Distribution of fine particulate density \n Across UHF Neighborhoods (Average over winters 2012-2014)')
+```
+Uneven distribution, should look geographically
+
+```{r}
+pm.1214.winter.avg.spdf = merge(uhf.spdf, pm.1214.winter.avg, by = 'Geo.Join.ID')
+```
+
+```{r}
+pm.1214.winter.avg.fort = make.fort(pm.1214.winter.avg.spdf)
+
+ggplot() +
+geom_polygon(data = pm.1214.winter.avg.fort, aes(x = long, y = lat, group = group, fill = avg_mcg_per_cm3)) +
+geom_path(data = pm.1214.winter.avg.fort, 
+          aes(x = long, y = lat, group = group), 
+          color = "white", size = 0.2) +
+coord_equal() +
+theme(panel.background=element_blank())+
+theme(panel.background= element_rect(color="black")) +
+theme(axis.title = element_blank(), axis.text = element_blank()) +
+scale_fill_continuous(type = "viridis") +
+labs(title = "PM2.5 concentration across NYC (Average over winters 2012-2014)", fill = 'Average PM2.5 \n concentration (mcg/cm3)')
+```
+
+Again seems uncorrelated with asthma. Should look just within boilers, as may have to do with particles within home.
+
+```{r}
+#Only has 2013 and 2015. Average these for each UHF Neighborhood.
+boiler.pm.1315.avg = air %>%
+  filter(Name == 'Boiler Emissions- Total PM2.5 Emissions',Geo.Type.Name == 'UHF42') %>%
+  group_by(Geo.Join.ID) %>%
+  summarize(n_per_km2 = mean(Data.Value))
+
+boiler.pm.1315.avg.spdf = merge(uhf.spdf, boiler.pm.1315.avg, by = 'Geo.Join.ID')
+
+spplot(boiler.pm.1315.avg.spdf, zcol = 'n_per_km2')
+```
+Again uncorrelated for CH, Bronx, SI, Rockaways. But aligns somewhat with Lower Manhattan hotspot.
+
+Overall: O3 related asthma hospitalizations align with those from the Medicare data. However, there are no universal correlates of air quality with asthma rates, not even O3 readings. The only alignments between 'hotspots' and air quality measures are:
+
+-   High O3 in Rockaways
+-   High benzene, fine particulate matter in Lower Manhattan. 
+
+## Zoning and asthma
+
+### Code zoning data
+
+Zoning data has no common identifiers. Will have to use some sort of geographic intersections.
+Relevant zone types:
+-   C8: Typical uses are automobile showrooms and repair shops, warehouses, gas stations and car washes - although all commercial uses as well as certain community facilities are permitted in C8 districts. Housing is not permitted and performance standards are imposed for certain semi-industrial uses
+
+-   M1: often a buffer between M2 or M3 districts and adjacent residential or commercial districts. Light industries typically found in M1 areas include woodworking shops, auto storage and repair shops, and wholesale service and storage facilities. In theory, nearly all industrial uses can locate in M1 areas if they meet the more stringent M1 performance standards. 
+
+
+-   M2: occupy the middle ground between light and heavy industrial areas
+
+-   M3: heavy industries that generate noise, traffic, or pollutants. Typical uses include power plants, solid waste transfer facilities and recycling plants, and fuel supply depots
+
+```{r}
+#Subset 'M' manufacturing/industrial zones
+indzd.spdf = nyzd.spdf[grepl('M',nyzd.spdf$ZONEDIST),]
+```
+
+
+Stack the plots
+
+```{r}
+#Fortify
+asthma.rate.byzip2014.fort = make.fort(asthma.rate.byzip2014.spdf)
+indzd.fort = make.fort(indzd.spdf)
+asthma.greater.fort = make.fort(asthma.greater.spdf)
+```
+
+```{r}
+ggplot() +
+  geom_polygon(data = asthma.rate.byzip2014.fort, aes(x = long, y = lat, group = group, fill = asthma_rate)) +
+  geom_path(data = asthma.rate.byzip2014.fort, aes(x = long, y = lat, group = group), color = "white", size = 0.2) +
+  scale_fill_continuous(type = "viridis") +
+  
+  geom_polygon(data = indzd.fort, aes(x = long, y = lat, group = group), fill = 'purple', alpha = 0.2) +
+  geom_path(data = indzd.fort, aes(x = long, y = lat, group = group), linetype = 'dashed', color = 'purple', size = 0.2) +
+  
+  coord_equal() +
+  theme(panel.background=element_blank())+
+  theme(panel.background= element_rect(color="black")) +
+  theme(axis.title = element_blank()) +
+  annotate("label", x = -74.14, y = 40.85, label = 'Highlighted regions indicate \n industrial zones') +
+  labs(title = "Industrial zones vs. Asthma rate", fill = 'Asthma rate')
+```
+
+Against significant areas
+
+```{r}
+ggplot() +
+  geom_polygon(data = asthma.greater.fort, aes(x = long, y = lat, group = group, fill = !sign_greater)) +
+  geom_path(data = asthma.greater.fort, aes(x = long, y = lat, group = group), 
+            color = "white", size = 0.2) +
+  scale_fill_manual(labels = c("True", "False"), values = c("#EA4969", "#56BFFB")) + 
+  
+  geom_polygon(data = indzd.fort, aes(x = long, y = lat, group = group), 
+               fill = 'purple', alpha = 0.5) +
+  geom_path(data = indzd.fort, aes(x = long, y = lat, group = group), linetype = 'dashed', color = 'purple', size = 0.1) +
+  
+  coord_equal() +
+  theme(panel.background=element_blank())+
+  theme(panel.background= element_rect(color="black")) +
+  theme(axis.title = element_blank()) +
+  annotate("label", x = -74.14, y = 40.85, label = 'Highlighted regions indicate \n industrial zones') +
+  labs(title = "Industrial zones vs. Asthma rate", fill = 'Asthma Rates \n significantly higher\n than city average')
+```
+It looks like Mott Haven and Staten Island hotspots are both industrial zones. There are two of the only large industrial areas overlapping with residential areas. However, a thorough investigation would involve coding geometry and multivariate calculus problems, which go outside the scope of this investigation.
+
+However, this does not seem to be the factor involved in CH region.
+
+## Rat data
+
+XXX maybe add wider time range to get more complete distribution
+
+```{r}
+#Initial and compliance only have 3 types of results, with one indicating rat activity
+rat %>%
+  filter(inspection_type == 'Initial') %>%
+  group_by(result) %>%
+  summarize(n())
+
+rat %>%
+  filter(inspection_type == 'Compliance') %>%
+  group_by(result) %>%
+  summarize(n())
+```
+
+```{r}
+#Get failed initial inspection rate by zip
+rat_result = function(x) {switch(x, 'Passed' = 'pass', 'Rat Activity' = 'rats', 'Failed for Other R' = 'other_fail')}
+
+rat.initial.zip = rat %>%
+  filter(inspection_type == 'Initial') %>%
+  rename(zip = zip_code) %>%
+  group_by(zip, result) %>%
+  summarize(counts = n()) %>%
+  mutate(result = sapply(result, rat_result)) %>%
+  pivot_wider(names_from = result, values_from = counts) %>%
+  mutate(pass = ifelse(is.na(pass), 0, pass), 
+         rats = ifelse(is.na(rats), 0, pass), 
+         other_fail = ifelse(is.na(other_fail), 0, pass)) %>%
+  mutate(total_inspections = sum(pass,rats,other_fail)) %>%
+  mutate(prop_rats = ifelse(total_inspections != 0, rats/total_inspections, 0))
+```
+
+```{r}
+rat.initial.zip.spdf = merge(zip.spdf, rat.initial.zip, by = 'zip')
+```
+
+```{r}
+# spplot(rat.initial.zip.spdf, zcol = 'prop_rats')
+```
+
+```{r}
+rat.initial.zip.fort = make.fort(rat.initial.zip.spdf)
+```
+
+```{r}
+ggplot(data = rat.initial.zip.fort, aes(x = long, y = lat, group = group, fill = prop_rats)) + 
+  geom_polygon() + 
+  scale_fill_continuous(type = "viridis") +
+  
+  geom_path(data = rat.initial.zip.fort, aes(x = long, y = lat, group = group), 
+            color = "white", size = 0.2) +
+  
+  coord_equal() +
+  theme(panel.background=element_blank())+
+  theme(panel.background= element_rect(color="black")) +
+  theme(axis.title = element_blank()) +
+  labs(fill = "Proportion", title = 'Proportion of inspections \n observing rat activity 2009-2014')
+```
+
+Yes, looks like higher in both CH region, Bronx (though not Mott Haven), and the Staten Island hotspots
+
+```{r}
+rat.compliance.zip = rat %>%
+  filter(inspection_type == 'Compliance') %>%
+  rename(zip = zip_code) %>%
+  group_by(zip, result) %>%
+  summarize(counts = n()) %>%
+  filter(zip != 0) %>%
+  mutate(result = sapply(result, rat_result)) %>%
+  pivot_wider(names_from = result, values_from = counts) %>%
+  mutate(pass = ifelse(is.na(pass), 0, pass),
+         rats = ifelse(is.na(rats), 0, pass),
+         other_fail = ifelse(is.na(other_fail), 0, pass)) %>%
+  mutate(total_inspections = sum(pass,rats,other_fail)) %>%
+  mutate(prop_rats = ifelse(total_inspections != 0, rats/total_inspections, 0))
+```
+
+```{r}
+rat.compliance.zip.spdf = merge(zip.spdf, rat.compliance.zip, by = 'zip')
+```
+
+```{r}
+#Compliance is similar but some areas drop out. Using initial to indicate "pre-city request" condition
+# spplot(rat.compliance.zip.spdf, zcol = 'prop_rats')
+```
+
+Indicates somewhat that asthma triggers related to sanitation may be more indicative than air quality alone in NYC. However, limited locational rat data, so unlikely to get strong results.
+
+```{r}
+#too limited data, nonsense
+# rat.initial.zip %>%
+#   select(zip, prop_rats) %>%
+#   mutate(zip = as.numeric(zip)) %>%
+#   inner_join(asthma.zip.rates, by = 'zip') %>%
+#   ggplot(data = ., aes(x = prop_rats, y = asthma_rate)) +
+#     geom_point()
+```
+
+### Survey correlation rat/asthma
+
+```{r}
+##Adds the factor of having seen rodents/mice in streets
+chs.rodent<-transform(chs20,strata=as.character(strata),rodent=as.factor(rodentsstreet))
+
+#define the survey
+chs.dsgn.rodent<-svydesign(ids = ~1,strata = ~strata,weights=~wt21_dual,data = chs.rodent,nest = TRUE,na.rm=TRUE)
+
+#age adjusted survey
+pop.agecat4=c(0.128810, 0.401725, 0.299194, 0.170271)
+chs.stdes.rodent<-svystandardize(subset(chs.dsgn.rodent,everasthma>0),
+                          by=~agegroup,over=~rodent,
+                          population=pop.agecat4,
+                          excluding.missing =~ agegroup+ ~rodent)
+
+#age adjusted prevalance estimates
+
+rod.vs.asthma.result =inner_join(
+  svyby(~everasthma==1,~rodent,chs.stdes.rodent,svyciprop,
+        vartype = "ci",method="xlogit",df=degf(chs.stdes.rodent)),
+           svyby(~everasthma==2,~rodent,chs.stdes.rodent,svyciprop,vartype =
+                   "ci",method="xlogit",df=degf(chs.stdes.rodent)),
+  by = 'rodent') %>% select(c(1,2,5))
+
+names(rod.vs.asthma.result) = c('rodent', 'asthma.yes', 'asthma.no')
+
+rod.vs.asthma.result = rod.vs.asthma.result %>%
+  pivot_longer(cols = c('asthma.yes', 'asthma.no'), names_to = c('asthma'), values_to = c('proportion'))
+```
+
+
+
+```{r}
+ggplot(rod.vs.asthma.result, aes(x = rodent, y = proportion, fill = asthma)) +
+  geom_col(position = 'dodge') +
+  labs(x = 'Rodent sightings', y = 'Proportion', fill = 'Diagnosed w/Asthma', 
+       title = 'Proportion of people diagnosed with asthma \n by neighborhood rodent sightings') +
+  scale_x_discrete(labels = c('Yes', 'No')) + 
+  scale_fill_discrete(labels = c('No', 'Yes'))
+```
+
+
+Higher percentage of people said yes among rat sighting group. Do Chi2 test and look at contingency.
+
+```{r}
+#rodent: 1 seen rodent; 2 hasn't
+#asthma 1 yes 2 no
+rodent.v.asthma = svytable(formula = ~rodent+everasthma, design = chs.stdes.rodent)
+
+svychisq(formula = ~everasthma+rodent, design = chs.stdes.rodent)
+```
+
+Rodent sighting groups have significantly different proportions of asthma.
+
+```{r}
+rodent.v.asthma.df = data.frame(rodent.v.asthma)
+
+ggplot(rodent.v.asthma.df, aes(x = rodent, y = Freq, fill = everasthma)) +
+  geom_col(position = 'fill') + 
+  labs(x = 'Rodent sightings', y = 'Proportion', fill = 'Diagnosed w/Asthma', 
+       title = 'Proportion of people diagnosed with asthma \n by neighborhood rodent sightings') +
+  scale_x_discrete(labels = c('Yes', 'No'))
+```
+
+```{r}
+row.names(rodent.v.asthma) = c('Yes', 'No')
+colnames(rodent.v.asthma) = c('Yes', 'No')
+
+mosaicplot(rodent.v.asthma, color = NULL, shade = TRUE, 
+           main = "Proportion of asthma diagnoses by rodent sightings",
+           xlab = 'Rodent sighting',
+           ylab = 'Diagnosed with asthma')
+```
+
+## SES and asthma
+
+### Geographic analysis
+
+
+```{r}
+#Merge income and population data for housed individuals
+income2020 = census2020 %>%
+  transmute(GeoID, zip, population = Pop_20, housed_pop = HHPop_20,
+            households = HHPop_20/AvHHSz_20) %>%
+  inner_join(income %>% select(GeoID, contains('!!Households!!Mean')),
+             by = 'GeoID') %>%
+  select(-6)
+
+names(income2020) = c('GeoID', 'zip', 'population', 'housed_pop', 'households', 'mean_HH_income')
+```
+
+
+```{r, warning = FALSE}
+#aggregate by zip
+mean.income.2020 = income2020 %>%
+  filter(!is.na(households) & !is.na(zip) & !is.na(mean_HH_income)) %>%
+  mutate(net_income = households * mean_HH_income) %>%
+  group_by(zip) %>%
+  summarize(housed_pop = sum(housed_pop), net_income = sum(net_income)) %>%
+  transmute(zip, avg_income = net_income/housed_pop) %>%
+  filter(zip != 11005) #remove outlier
+
+row.names(mean.income.2020) = mean.income.2020$zip
+```
+
+
+
+```{r, warning=FALSE}
+mean.income.2020.spdf = merge(zip.spdf, mean.income.2020, by = 'zip')
+mean.income.2020.fort = make.fort(mean.income.2020.spdf)
+```
+
+```{r}
+ggplot(mean.income.2020.fort, aes(x = long, y = lat, group = group, fill = log(avg_income, base = 10))) +
+  geom_polygon() +
+  scale_fill_continuous(type = 'viridis') + 
+  
+  coord_equal() +
+  theme(panel.background=element_blank())+
+  theme(panel.background= element_rect(color="black")) +
+  theme(axis.title = element_blank()) +
+  labs(title = "Average Household Income", fill = 'log(Average HH Income)')
+```
+
+### Poverty and asthma rate correlation
+
+```{r}
+#warning, not from same year, but this is what was available
+income.vs.rate = inner_join(mean.income.2020, asthma.rate.byzip2014, by = 'zip') %>% select(avg_income, asthma_rate)
+```
+
+```{r}
+#all over the place for low income, but somewhat downward trend (higher income, lower asthma rate)
+ggplot(income.vs.rate, aes(x = log10(avg_income), y = asthma_rate)) + 
+  geom_point() +
+  labs(title = 'Average Household Income vs. Asthma Rate among Medicare patients \n by Zip',
+       x = 'log(Average Household Income)', y = 'Asthma Rate')
+```
+```{r}
+cor(income.vs.rate$asthma_rate, income.vs.rate$avg_income)
+```
+
+So many Zips fall in the lower income that it is not a predictor. Probably involves more advanced analysis combining income WHEN amongst other environmental triggers.
+
+More visible on census tracts.
+
+```{r}
+house.income.2020.tract = income %>% select(GeoID, contains('!!Households!!Mean')) %>% select(1:2) 
+names(house.income.2020.tract) = c('GEOID', 'hh_mean_income')
+house.income.2020.tract.spdf = merge(tract.spdf, house.income.2020.tract, by = 'GEOID')
+```
+
+```{r}
+house.income.2020.tract.fort = make.fort(house.income.2020.tract.spdf)
+ggplot(house.income.2020.tract.fort, aes(x = long, y = lat, group = group, fill = log10(hh_mean_income))) +
+  geom_polygon() +
+  scale_fill_continuous(type = 'viridis') +
+  
+  coord_equal() +
+  theme(panel.background=element_blank())+
+  theme(panel.background= element_rect(color="black")) +
+  theme(axis.title = element_blank()) +
+  labs(title = "Average Household Income", fill = 'log(Average HH Income)')
+```
+
+### Survey analysis
+
+```{r}
+##Adds the factor of having seen rodents/mice in streets
+chs.pov<-transform(chs20,strata=as.character(strata),npovgrp=as.factor(imputed_neighpovgroup4_1519))
+
+#define the survey
+chs.dsgn.pov<-svydesign(ids = ~1,strata = ~strata,weights=~wt21_dual,data = chs.pov,nest = TRUE,na.rm=TRUE)
+
+#age adjusted survey
+pop.agecat4=c(0.128810, 0.401725, 0.299194, 0.170271)
+chs.stdes.pov<-svystandardize(subset(chs.dsgn.pov,everasthma>0 ),by=~agegroup,over=~npovgrp,population=pop.agecat4,excluding.missing =~ agegroup+ ~npovgrp)
+
+#age adjusted prevalance estimates
+
+svyby(~everasthma==1,~npovgrp,chs.stdes.pov,svyciprop,vartype = "ci",method="xlogit",df=degf(chs.stdes.pov))
+svyby(~everasthma==2,~npovgrp,chs.stdes.pov,svyciprop,vartype = "ci",method="xlogit",df=degf(chs.stdes.pov))
+```
+
+```{r}
+#pov groups 0-4 increasing poverty
+#asthma 1 yes 2 no
+asthma.v.povgrp = svytable(formula = ~npovgrp+everasthma, design = chs.stdes.pov)
+
+svychisq(formula = ~everasthma+npovgrp, design = chs.stdes.pov)
+```
+
+
+```{r}
+asthma.v.povgrp.df = data.frame(asthma.v.povgrp)
+
+ggplot(asthma.v.povgrp.df, aes(x = npovgrp, y = Freq, fill = everasthma)) +
+  geom_col(position = 'fill') + 
+  labs(x = 'Poverty Group', y = 'Proportion', fill = 'Diagnosed w/Asthma', 
+       title = 'Proportion of people diagnosed with asthma \n by Neighborhood Poverty Group') +
+  scale_x_discrete(labels = c('Low', 'Med', 'High', 'Very High')) 
+```
+
+```{r}
+
+row.names(asthma.v.povgrp) = c('Low', 'Med', 'High', 'Very High')
+colnames(asthma.v.povgrp) = c('Yes', 'No')
+
+mosaicplot(asthma.v.povgrp, color = NULL, shade = TRUE, 
+           main = "Proportion of asthma diagnoses by Neighborhood Poverty Group",
+           xlab = 'Neighborhood Poverty Group',
+           ylab = 'Diagnosed with asthma')
+```
+
+
+
+

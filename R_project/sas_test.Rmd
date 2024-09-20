@@ -1,0 +1,62 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls(all=TRUE))
+library("haven")
+library("survey")
+library(dplyr)
+require(data.table)
+chs20<-read_sas("data/chs2020_public.sas7bdat")
+```
+
+
+Construct survey over all participants
+
+```{r}
+chs<-transform(chs20,strata=as.character(strata),all=as.factor(survey))
+```
+
+
+Create weighted survey design
+
+```{r}
+#define the survey
+chs.dsgn<-svydesign(ids = ~1,strata = ~strata,weights=~wt21_dual,data = chs,nest = TRUE,na.rm=TRUE )
+```
+
+Age adjust survey result group
+
+```{r}
+#age adjusted survey
+pop.agecat4=c(0.128810, 0.401725, 0.299194, 0.170271)
+chs.stdes<-svystandardize(subset(chs.dsgn,everasthma>0 ),by=~agegroup,over=~all,population=pop.agecat4,excluding.missing =~ agegroup+ ~all)
+```
+
+```{r}
+#age adjusted prevalance estimates
+
+svyby(~everasthma==1,~all,chs.stdes,svyciprop,vartype = "ci",method="xlogit",df=degf(chs.dsgn))
+svyby(~everasthma==2,~all,chs.stdes,svyciprop,vartype = "ci",method="xlogit",df=degf(chs.dsgn))
+```
+By birthsex
+
+```{r}
+#estimate by sex
+##Adds the birthsex factor
+chs<-transform(chs20,strata=as.character(strata),allsex2=as.factor(birthsex))
+
+#define the survey
+chs.dsgn<-svydesign(ids = ~1,strata = ~strata,weights=~wt21_dual,data = chs,nest = TRUE,na.rm=TRUE )
+#age adjusted survey
+pop.agecat4=c(0.128810, 0.401725, 0.299194, 0.170271)
+chs.stdes<-svystandardize(subset(chs.dsgn,everasthma>0 ),by=~agegroup,over=~allsex2,population=pop.agecat4,excluding.missing =~ agegroup+ ~allsex2)
+
+#age adjusted prevalance estimates
+
+svyby(~everasthma==1,~allsex2,chs.stdes,svyciprop,vartype = "ci",method="xlogit",df=degf(chs.dsgn))
+svyby(~everasthma==2,~allsex2,chs.stdes,svyciprop,vartype = "ci",method="xlogit",df=degf(chs.dsgn))
+```
+

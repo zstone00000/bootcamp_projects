@@ -1,0 +1,45 @@
+---
+title: "tobacco_data"
+author: "Zach Stone"
+date: "2022-08-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+tobac_data = read.csv('data/Active_Tobacco_Retail_Dealer_Licenses.csv')
+```
+
+```{r}
+tobac = tobac_data
+str(tobac)
+```
+```{r}
+tobac = tobac %>%
+  filter(License.Status == 'Active') %>%
+  select(License.Type, Industry, Zip = Address.ZIP, Boro = Address.Borough, Tract = Census.Tract, Location)
+
+#Only type in relevant dataset is business, so can drop
+tobac %>%
+  select(License.Type) %>%
+  unique()
+
+#as is Industry
+tobac %>%
+  select(Industry) %>%
+  unique()
+
+tobac = tobac %>% select(-c('License.Type', 'Industry'))
+
+tobac %>%
+  group_by(Zip) %>%
+  summarize(n())
+
+
+
+```
+
